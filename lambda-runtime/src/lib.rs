@@ -125,11 +125,11 @@ impl Runtime {
     }
 }
 
-/// The header and body extracted from the lambda event
+/// The HTTP header and body extracted from the lambda event
 pub struct EventParts(pub http::HeaderMap<http::HeaderValue>, pub bytes::Bytes);
 
 /// Default way to get EventParts from a lambda event
-pub async fn event_parts(event: Result<http::Response<hyper::Body>, Error>) -> Result<EventParts, Error> {
+pub async fn get_event_parts(event: Result<http::Response<hyper::Body>, Error>) -> Result<EventParts, Error> {
     let (parts, body) = event?.into_parts();
     let body = hyper::body::to_bytes(body).await?;
     Ok(EventParts(parts.headers, body))
@@ -232,7 +232,8 @@ where
         A: for<'de> Deserialize<'de>,
         B: Serialize,
     {
-        self.run_with_middleware(incoming, event_parts, handler, config).await
+        self.run_with_middleware(incoming, get_event_parts, handler, config)
+            .await
     }
 }
 
@@ -305,48 +306,6 @@ where
 
 /// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
 /// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
-///
-/// # Example
-/// ```no_run
-/// use lambda_runtime::{handler_fn, Context};
-/// use serde_json::Value;
-///
-/// type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Error> {
-///     let func = handler_fn(func);
-///     lambda_runtime::run(func).await?;
-///     Ok(())
-/// }
-///
-/// async fn func(event: Value, _: Context) -> Result<Value, Error> {
-///     Ok(event)
-/// }
-/// ```
-pub async fn run<A, B, F>(handler: F) -> Result<(), Error>
-where
-    F: Handler<A, B>,
-    <F as Handler<A, B>>::Fut: Future<Output = Result<B, <F as Handler<A, B>>::Error>>,
-    <F as Handler<A, B>>::Error: fmt::Display,
-    A: for<'de> Deserialize<'de>,
-    B: Serialize,
-{
-    trace!("Loading config from env");
-    let config = Config::from_env()?;
-    let uri = config.endpoint.clone().try_into().expect("Unable to convert to URL");
-    let runtime = Runtime::builder()
-        .with_endpoint(uri)
-        .build()
-        .expect("Unable to create a runtime");
-
-    let client = &runtime.client;
-    let incoming = incoming(client);
-    runtime.run(incoming, handler, &config).await
-}
-
-/// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
-/// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
 /// The middleware function allows modifying the lambda event prior to
 /// deserialization.
 ///
@@ -395,6 +354,38 @@ where
     runtime
         .run_with_middleware(incoming, middleware, handler, &config)
         .await
+}
+
+/// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
+/// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
+///
+/// # Example
+/// ```no_run
+/// use lambda_runtime::{handler_fn, Context};
+/// use serde_json::Value;
+///
+/// type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Error> {
+///     let func = handler_fn(func);
+///     lambda_runtime::run(func).await?;
+///     Ok(())
+/// }
+///
+/// async fn func(event: Value, _: Context) -> Result<Value, Error> {
+///     Ok(event)
+/// }
+/// ```
+pub async fn run<A, B, F>(handler: F) -> Result<(), Error>
+where
+    F: Handler<A, B>,
+    <F as Handler<A, B>>::Fut: Future<Output = Result<B, <F as Handler<A, B>>::Error>>,
+    <F as Handler<A, B>>::Error: fmt::Display,
+    A: for<'de> Deserialize<'de>,
+    B: Serialize,
+{
+    run_with_middleware(get_event_parts, handler).await
 }
 
 fn type_name_of_val<T>(_: T) -> &'static str {
