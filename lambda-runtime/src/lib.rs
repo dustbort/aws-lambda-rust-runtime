@@ -125,6 +125,16 @@ impl Runtime {
     }
 }
 
+/// The header and body extracted from the lambda event
+pub struct EventParts(pub http::HeaderMap<http::HeaderValue>, pub bytes::Bytes);
+
+/// Default way to get EventParts from a lambda event
+pub async fn event_parts(event: Result<http::Response<hyper::Body>, Error>) -> Result<EventParts, Error> {
+    let (parts, body) = event?.into_parts();
+    let body = hyper::body::to_bytes(body).await?;
+    Ok(EventParts(parts.headers, body))
+}
+
 impl<C> Runtime<C>
 where
     C: Service<http::Uri> + Clone + Send + Sync + Unpin + 'static,
@@ -132,9 +142,10 @@ where
     <C as Service<http::Uri>>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     <C as Service<http::Uri>>::Response: AsyncRead + AsyncWrite + Connection + Unpin + Send + 'static,
 {
-    pub async fn run<F, A, B>(
+    pub async fn run_with_middleware<F, A, B, M, MO>(
         &self,
         incoming: impl Stream<Item = Result<http::Response<hyper::Body>, Error>> + Send,
+        mut middleware: M,
         mut handler: F,
         config: &Config,
     ) -> Result<(), Error>
@@ -144,17 +155,17 @@ where
         <F as Handler<A, B>>::Error: fmt::Display,
         A: for<'de> Deserialize<'de>,
         B: Serialize,
+        MO: Future<Output = Result<EventParts, Error>>,
+        M: FnMut(Result<http::Response<hyper::Body>, Error>) -> MO,
     {
         let client = &self.client;
         tokio::pin!(incoming);
         while let Some(event) = incoming.next().await {
             trace!("New event arrived (run loop)");
-            let event = event?;
-            let (parts, body) = event.into_parts();
+            let EventParts(headers, body) = middleware(event).await?;
 
-            let ctx: Context = Context::try_from(parts.headers)?;
+            let ctx: Context = Context::try_from(headers)?;
             let ctx: Context = ctx.with_config(config);
-            let body = hyper::body::to_bytes(body).await?;
             trace!("{}", std::str::from_utf8(&body)?); // this may be very verbose
             let body = serde_json::from_slice(&body)?;
 
@@ -206,6 +217,22 @@ where
             client.call(req).await.expect("Unable to send response to Runtime APIs");
         }
         Ok(())
+    }
+
+    pub async fn run<F, A, B>(
+        &self,
+        incoming: impl Stream<Item = Result<http::Response<hyper::Body>, Error>> + Send,
+        handler: F,
+        config: &Config,
+    ) -> Result<(), Error>
+    where
+        F: Handler<A, B>,
+        <F as Handler<A, B>>::Fut: Future<Output = Result<B, <F as Handler<A, B>>::Error>>,
+        <F as Handler<A, B>>::Error: fmt::Display,
+        A: for<'de> Deserialize<'de>,
+        B: Serialize,
+    {
+        self.run_with_middleware(incoming, event_parts, handler, config).await
     }
 }
 
@@ -309,7 +336,6 @@ where
     let config = Config::from_env()?;
     let uri = config.endpoint.clone().try_into().expect("Unable to convert to URL");
     let runtime = Runtime::builder()
-        .with_connector(HttpConnector::new())
         .with_endpoint(uri)
         .build()
         .expect("Unable to create a runtime");
@@ -317,6 +343,58 @@ where
     let client = &runtime.client;
     let incoming = incoming(client);
     runtime.run(incoming, handler, &config).await
+}
+
+/// Starts the Lambda Rust runtime and begins polling for events on the [Lambda
+/// Runtime APIs](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html).
+/// The middleware function allows modifying the lambda event prior to
+/// deserialization.
+///
+/// # Example
+/// ```no_run
+/// use lambda_runtime::{handler_fn, Context};
+/// use serde_json::Value;
+///
+/// type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Error> {
+///     let func = handler_fn(func);
+///     lambda_runtime::run_with_middleware(middleware, func).await?;
+///     Ok(())
+/// }
+///
+/// fn middleware(Result<http::Response<hyper::Body>, Error>) -> Result<http::Response<hyper::Body>, Error> {
+///     // ... modify the result as desired
+/// }
+///
+/// async fn func(event: Value, _: Context) -> Result<Value, Error> {
+///     Ok(event)
+/// }
+/// ```
+pub async fn run_with_middleware<A, B, F, M, MO>(middleware: M, handler: F) -> Result<(), Error>
+where
+    F: Handler<A, B>,
+    <F as Handler<A, B>>::Fut: Future<Output = Result<B, <F as Handler<A, B>>::Error>>,
+    <F as Handler<A, B>>::Error: fmt::Display,
+    A: for<'de> Deserialize<'de>,
+    B: Serialize,
+    MO: Future<Output = Result<EventParts, Error>>,
+    M: FnMut(Result<http::Response<hyper::Body>, Error>) -> MO,
+{
+    trace!("Loading config from env");
+    let config = Config::from_env()?;
+    let uri = config.endpoint.clone().try_into().expect("Unable to convert to URL");
+    let runtime = Runtime::builder()
+        .with_endpoint(uri)
+        .build()
+        .expect("Unable to create a runtime");
+
+    let client = &runtime.client;
+    let incoming = incoming(client);
+    runtime
+        .run_with_middleware(incoming, middleware, handler, &config)
+        .await
 }
 
 fn type_name_of_val<T>(_: T) -> &'static str {
